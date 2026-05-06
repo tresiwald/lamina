@@ -244,6 +244,87 @@ dataset = InternalsDataset.from_hf_dataset(ds, text_col="sentence", property_col
 
 ---
 
+## System prompts
+
+System prompts are applied using `tokenizer.apply_chat_template` so that the correct chat format (`<|system|>`, `[INST]`, `<|im_start|>`, …) is automatically selected for the loaded model.  A plain-concatenation fallback (`"{system}\n\n{text}"`) is used for tokenizers without a registered chat template.
+
+### Priority (highest first)
+
+| Level | How to set |
+|---|---|
+| Per-instance | `InternalsInstance(system_prompt="…")` |
+| Per-run default | `dataset.run(…, system_prompt="…")` |
+| Per-row from HF dataset | `InternalsDataset(ds, system_prompt_col="col_name")` |
+
+### Per-run system prompt
+
+Apply the same system prompt to every instance in a run:
+
+```python
+records = dataset.run(
+    model, tokenizer,
+    system_prompt="You are a helpful assistant. Answer concisely.",
+    generate_kwargs={"max_new_tokens": 50},
+)
+```
+
+### Per-instance system prompt
+
+Override the run-level default for individual instances:
+
+```python
+dataset = InternalsDataset([
+    InternalsInstance(
+        text="Is Paris in France?",
+        system_prompt="Answer in one word.",
+        properties={"label": "yes"},
+    ),
+    InternalsInstance(
+        text="Summarise the French Revolution.",
+        system_prompt="You are a history professor. Be detailed.",
+        properties={"label": "essay"},
+    ),
+])
+
+records = dataset.run(model, tokenizer, generate_kwargs={"max_new_tokens": 100})
+```
+
+### Per-row system prompt from a HuggingFace dataset
+
+Pass `system_prompt_col` to read per-row system prompts from a dataset column:
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("my-org/qa-with-personas", split="test")
+# ds has columns: "question", "answer", "persona"
+
+dataset = InternalsDataset(
+    ds,
+    text_col="question",
+    property_cols=["answer"],
+    system_prompt_col="persona",      # each row gets its own system prompt
+)
+
+records = dataset.run(model, tokenizer, generate_kwargs={"max_new_tokens": 50})
+```
+
+### TextSpan resolution with system prompts
+
+Spans are resolved against the *fully formatted* string that was actually tokenised (system prompt included), so token offsets remain correct:
+
+```python
+instance = InternalsInstance(
+    text="The Eiffel Tower is in Paris.",
+    system_prompt="Answer geography questions.",
+    spans={"city": "Paris"},
+)
+# span_hidden_states_mean["city"] correctly averages the "Paris" tokens
+# even though the system prompt shifts token positions.
+```
+
+---
+
 ## Spans
 
 Spans average hidden states over a named sub-sequence of the prompt, stored alongside the full extraction.
