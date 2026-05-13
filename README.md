@@ -325,6 +325,70 @@ instance = InternalsInstance(
 
 ---
 
+## Thinking models
+
+Reasoning models (DeepSeek-R1, Qwen3, …) produce a visible thinking phase before their answer.  lamina can extract the hidden state vector right at the last thinking token — the model's internal representation at the moment it transitions from reasoning to responding.
+
+### Priority (highest first)
+
+| Level | How to set |
+|---|---|
+| Per-instance | `InternalsInstance(thinking_end_token="</think>")` |
+| Per-run default | `dataset.run(…, thinking_end_token="</think>")` |
+
+### Basic usage
+
+```python
+records = dataset.run(
+    model, tokenizer,
+    thinking_end_token="</think>",
+    generate_kwargs={"max_new_tokens": 512},
+)
+
+rec = records[0]
+print(rec.thinking_hidden_state.shape)   # (num_layers, hidden_dim)
+print(rec.thinking_end_token_pos)        # e.g. 247  (index in output sequence)
+```
+
+### Per-instance override
+
+```python
+dataset = InternalsDataset([
+    InternalsInstance(
+        text="How many r's in 'strawberry'?",
+        thinking_end_token="</think>",
+        properties={"label": 3},
+    ),
+    InternalsInstance(
+        text="What is 2 + 2?",
+        # no thinking_end_token — thinking_hidden_state will be None
+        properties={"label": 4},
+    ),
+])
+
+records = dataset.run(model, tokenizer, generate_kwargs={"max_new_tokens": 256})
+```
+
+### What is extracted
+
+After generation lamina:
+
+1. Encodes `thinking_end_token` with `tokenizer.encode(add_special_tokens=False)` to obtain its token ID(s).
+2. Strips the prompt tokens from the generated sequence.
+3. Finds the **last** occurrence of the thinking-end token in the output IDs.
+4. Slices `output_hidden_states[:, pos, :]` across all layers.
+
+Result stored in `InternalsRecord`:
+
+| Attribute | Shape | Description |
+|---|---|---|
+| `thinking_hidden_state` | `(num_layers, hidden_dim)` | Hidden state at the last thinking token |
+| `thinking_end_token_pos` | `int` | 0-based index in the **output** token sequence |
+
+If the token is not found in the generated output, `thinking_hidden_state` is `None` and a warning is issued.
+
+---
+
 ## Spans
 
 Spans average hidden states over a named sub-sequence of the prompt, stored alongside the full extraction.

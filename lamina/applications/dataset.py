@@ -3,11 +3,11 @@ Dataset processing layer for lamina.
 
 InternalsInstance
     One item: text/token-ids + arbitrary task properties + optional spans
-    + an optional per-instance system prompt.
+    + an optional per-instance system prompt + an optional thinking end token.
 
 InternalsRecord
     Result for one instance: the full InternalsRun + task properties +
-    per-span averaged hidden states.
+    per-span averaged hidden states + optional thinking-end hidden state.
 
 InternalsDataset
     An ordered collection of instances with a ``.run()`` method that drives
@@ -29,6 +29,23 @@ Priority (highest first):
 TextSpan resolution works correctly even with system prompts because spans are
 resolved against the *fully formatted* string that was actually tokenised, not
 just the raw user text.
+
+Thinking models
+---------------
+For models that produce a visible thinking phase (DeepSeek-R1, Qwen3, …) the
+hidden state at the **last thinking token** can be extracted automatically.
+
+Set ``thinking_end_token`` (e.g. ``"</think>"``) at instance or run level.
+After generation lamina scans the output token IDs for the last occurrence of
+that token and slices ``output_hidden_states`` at that position.  The result is
+stored in ``InternalsRecord.thinking_hidden_state`` with shape
+``(num_layers, hidden_dim)``.
+
+Priority (highest first):
+
+1. ``instance.thinking_end_token`` — per-instance override
+2. ``run(thinking_end_token=…)``   — default for the whole run
+3. No extraction                   — ``thinking_hidden_state`` is ``None``
 
 Model-type detection
 --------------------
@@ -99,11 +116,32 @@ class InternalsInstance:
                 system_prompt="Answer in one word.",
                 properties={"label": "yes"},
             )
+    thinking_end_token : str, optional
+        The token string that marks the end of the thinking phase for
+        reasoning models (e.g. ``"</think>"`` for DeepSeek-R1 / Qwen3).
+
+        After generation lamina scans the output token IDs for the *last*
+        occurrence of this token and extracts
+        ``output_hidden_states[:, pos, :]`` at that position.  The result
+        is stored in :attr:`InternalsRecord.thinking_hidden_state` with
+        shape ``(num_layers, hidden_dim)``.
+
+        Overrides the ``thinking_end_token`` argument of
+        :meth:`InternalsDataset.run` for this specific instance.
+
+        Example::
+
+            InternalsInstance(
+                text="How many r's in 'strawberry'?",
+                thinking_end_token="</think>",
+                properties={"label": 3},
+            )
     """
     text: Union[str, List[int]]
     properties: Dict[str, Any] = field(default_factory=dict)
     spans: Optional[Union[Dict[str, _SpanValue], List[TextSpan]]] = None
     system_prompt: Optional[str] = None
+    thinking_end_token: Optional[str] = None
 
     def __post_init__(self):
         if self.spans is None:
@@ -146,11 +184,22 @@ class InternalsRecord:
     resolved_spans : dict[str, SpanSpec] | None
     span_hidden_states_mean : dict[str, np.ndarray] | None
         Per-span, per-layer mean hidden state.  Shape: ``(num_layers, hidden)``.
+    thinking_hidden_state : np.ndarray | None
+        Hidden state at the last thinking token (e.g. ``</think>``).
+        Shape: ``(num_layers, hidden_dim)``.  ``None`` when no
+        ``thinking_end_token`` was set or the token was not found in the
+        generated output.
+    thinking_end_token_pos : int | None
+        Zero-based index into the *output* token sequence where the last
+        thinking token was found.  ``None`` when ``thinking_hidden_state``
+        is ``None``.
     """
     instance: InternalsInstance
     run: Any                   # InternalsRun (avoid circular import)
     resolved_spans: Optional[Dict[str, SpanSpec]] = None
     span_hidden_states_mean: Optional[Dict[str, np.ndarray]] = None
+    thinking_hidden_state: Optional[np.ndarray] = None
+    thinking_end_token_pos: Optional[int] = None
 
     @property
     def properties(self) -> Dict[str, Any]:
@@ -162,10 +211,15 @@ class InternalsRecord:
 
     def __repr__(self) -> str:
         span_names = list(self.resolved_spans or self.instance.spans or {})
+        think_str = (
+            f", thinking_pos={self.thinking_end_token_pos}"
+            if self.thinking_end_token_pos is not None else ""
+        )
         return (
             f"InternalsRecord("
             f"properties={self.properties}, "
-            f"spans={span_names}, "
+            f"spans={span_names}"
+            f"{think_str}, "
             f"run={self.run})"
         )
 
@@ -209,6 +263,56 @@ def _apply_system_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Thinking-token extraction helper
+# ---------------------------------------------------------------------------
+
+def _extract_thinking_hidden_state(
+    run: Any,
+    generated_ids: "np.ndarray",   # shape (output_len,)  — 1-D, batch stripped
+    thinking_end_token_id: int,
+) -> "tuple[Optional[np.ndarray], Optional[int]]":
+    """
+    Find the last occurrence of *thinking_end_token_id* in *generated_ids*
+    and return the hidden state at that position across all layers.
+
+    Parameters
+    ----------
+    run : InternalsRun
+        A finalised run with ``output_hidden_states`` populated.
+    generated_ids : np.ndarray
+        1-D array of generated token IDs (prompt tokens excluded).
+    thinking_end_token_id : int
+        Token ID to search for.
+
+    Returns
+    -------
+    (hidden_state, pos) or (None, None)
+        hidden_state : np.ndarray of shape ``(num_layers, hidden_dim)``
+        pos          : int, 0-based index in the output sequence
+    """
+    if run.output_hidden_states is None:
+        return None, None
+
+    # Find the last occurrence of the token in the output sequence
+    positions = np.where(generated_ids == thinking_end_token_id)[0]
+    if positions.size == 0:
+        return None, None
+
+    pos = int(positions[-1])
+    num_layers = len(run.output_hidden_states)
+    output_len = run.output_hidden_states[0].shape[1]
+
+    if pos >= output_len:
+        return None, None
+
+    layer_vecs: List[np.ndarray] = []
+    for hs in run.output_hidden_states:        # hs: (batch, output_len, hidden)
+        layer_vecs.append(hs[0, pos, :].astype(np.float32))
+
+    return np.stack(layer_vecs, axis=0), pos   # (num_layers, hidden_dim)
+
+
+# ---------------------------------------------------------------------------
 # InternalsDataset
 # ---------------------------------------------------------------------------
 
@@ -244,6 +348,12 @@ class InternalsDataset:
     2. ``dataset.run(…, system_prompt="…")`` — default for the whole run
     3. ``system_prompt_col`` in the HF dataset constructor — per-row from a
        column, stored as ``instance.system_prompt``
+
+    Thinking models
+    ---------------
+    Pass ``thinking_end_token="</think>"`` to ``run()`` (or set it on
+    individual instances) to extract the hidden state at the last thinking
+    token.  See :meth:`run` for details.
     """
 
     def __init__(
@@ -359,6 +469,7 @@ class InternalsDataset:
         finalize_timeout: float = 60.0,
         verbose: bool = True,
         system_prompt: Optional[str] = None,
+        thinking_end_token: Optional[str] = None,
     ) -> List[InternalsRecord]:
         """
         Process every instance and return a list of :class:`InternalsRecord`.
@@ -394,6 +505,27 @@ class InternalsDataset:
             To use *different* system prompts per instance, set
             ``InternalsInstance.system_prompt`` directly.  Per-instance
             system prompts always take priority over this argument.
+        thinking_end_token : str, optional
+            Token string marking the end of the thinking phase for reasoning
+            models (e.g. ``"</think>"`` for DeepSeek-R1 / Qwen3).
+
+            After generation lamina scans the output token IDs for the *last*
+            occurrence of this token and stores the hidden state at that
+            position in :attr:`InternalsRecord.thinking_hidden_state`
+            (shape ``(num_layers, hidden_dim)``) and the output-sequence
+            position in :attr:`InternalsRecord.thinking_end_token_pos`::
+
+                records = dataset.run(
+                    model, tokenizer,
+                    thinking_end_token="</think>",
+                    generate_kwargs={"max_new_tokens": 512},
+                )
+                hs = records[0].thinking_hidden_state   # (num_layers, hidden)
+                pos = records[0].thinking_end_token_pos  # int
+
+            Per-instance ``thinking_end_token`` always takes priority.
+            If the token is not present in the generated output,
+            ``thinking_hidden_state`` is ``None`` and a warning is issued.
         """
         import lamina
         from lamina.extractors.hf.extractor import run_forward
@@ -417,6 +549,11 @@ class InternalsDataset:
 
             # ── Effective system prompt (instance overrides run-level) ─────────
             effective_sp: Optional[str] = instance.system_prompt or system_prompt
+
+            # ── Effective thinking token (instance overrides run-level) ────────
+            effective_tt: Optional[str] = (
+                instance.thinking_end_token or thinking_end_token
+            )
 
             # ── Encode ────────────────────────────────────────────────────────
             # text_for_spans is the string actually passed to the tokenizer;
@@ -455,11 +592,16 @@ class InternalsDataset:
                 resolved_spans = instance.spans  # type: ignore[assignment]
 
             # ── Inference ─────────────────────────────────────────────────────
+            gen_output = None
             if use_generate:
                 kwargs = dict(gkw)
                 if "attention_mask" in enc:
                     kwargs.setdefault("attention_mask", enc["attention_mask"])
-                model.generate(input_ids, **kwargs)
+                # Always request return_dict_in_generate so we can read
+                # .sequences for thinking-token detection.
+                if effective_tt is not None:
+                    kwargs.setdefault("return_dict_in_generate", True)
+                gen_output = model.generate(input_ids, **kwargs)
             else:
                 run_forward(model, **enc)
 
@@ -477,6 +619,55 @@ class InternalsDataset:
                     f"within {finalize_timeout}s"
                 )
 
+            # ── Thinking-token hidden state ───────────────────────────────────
+            thinking_hs:  Optional[np.ndarray] = None
+            thinking_pos: Optional[int]        = None
+
+            if effective_tt is not None and use_generate and gen_output is not None:
+                # Resolve the thinking end token to a single token ID.
+                tt_ids = tokenizer.encode(
+                    effective_tt, add_special_tokens=False
+                )
+                if not tt_ids:
+                    warnings.warn(
+                        f"[lamina] thinking_end_token {effective_tt!r} encodes "
+                        "to an empty sequence — skipping thinking extraction.",
+                        stacklevel=2,
+                    )
+                elif run.output_hidden_states is None:
+                    warnings.warn(
+                        "[lamina] thinking_end_token set but output_hidden_states "
+                        "are unavailable (encoder-only model?) — skipping.",
+                        stacklevel=2,
+                    )
+                else:
+                    # Extract the generated token IDs (prompt stripped).
+                    if hasattr(gen_output, "sequences"):
+                        full_ids = gen_output.sequences[0].cpu().numpy()
+                    else:
+                        # Plain tensor returned (return_dict_in_generate=False)
+                        full_ids = gen_output[0].cpu().numpy()
+                    prompt_len = int(input_ids.shape[-1])
+                    generated_ids = full_ids[prompt_len:]
+
+                    # Use only the first sub-token if thinking token is multi-token
+                    tt_id = tt_ids[-1]  # last token is the closing ">" char
+                    if len(tt_ids) > 1:
+                        # Search for the full sequence; use position of last token
+                        # (most robust single-token anchor for the closing tag)
+                        tt_id = tt_ids[-1]
+
+                    thinking_hs, thinking_pos = _extract_thinking_hidden_state(
+                        run, generated_ids, tt_id
+                    )
+                    if thinking_hs is None:
+                        warnings.warn(
+                            f"[lamina] thinking_end_token {effective_tt!r} "
+                            f"(token_id={tt_id}) was not found in the generated "
+                            "output — thinking_hidden_state will be None.",
+                            stacklevel=2,
+                        )
+
             # ── Span averages ─────────────────────────────────────────────────
             span_means = _compute_span_means(run, resolved_spans)
             records.append(InternalsRecord(
@@ -484,6 +675,8 @@ class InternalsDataset:
                 run=run,
                 resolved_spans=resolved_spans,
                 span_hidden_states_mean=span_means,
+                thinking_hidden_state=thinking_hs,
+                thinking_end_token_pos=thinking_pos,
             ))
 
         if verbose:
