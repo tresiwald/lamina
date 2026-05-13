@@ -23,6 +23,7 @@ pip install lamina[hf]
 | `logits` | `(steps, batch, vocab)` | LM-head output at the last position of each step |
 | `logit_lens` | `list[layer] → (batch, input_len, vocab)` | LM-head applied to each layer's hidden state *(opt-in)* |
 | `span_<name>` | `(num_layers, hidden)` | Per-layer mean over a named token span *(opt-in)* |
+| `thinking_hidden_state` | `(num_layers, hidden)` | Hidden state at the last thinking token (e.g. `</think>`) *(opt-in)* |
 
 Layer `0` is always the embedding output; layers `1..N` are transformer block outputs.
 
@@ -557,6 +558,21 @@ lamina.set_config(extract_logit_lens=True, max_stored_runs=100)
 | `num_layers` | `int` | Transformer blocks + 1 (embedding) |
 | `is_encoder_decoder` | `bool` | True for T5, BART, … |
 | `is_finalized` | `bool` | True once the worker thread has finished |
+
+### `InternalsRecord` attributes
+
+Returned by `InternalsDataset.run()`.
+
+| Attribute | Type | Description |
+|---|---|---|
+| `instance` | `InternalsInstance` | The source instance |
+| `run` | `InternalsRun` | The full extraction result |
+| `properties` | `dict` | Shortcut for `instance.properties` |
+| `spans` | `dict \| None` | Shortcut for `instance.spans` |
+| `resolved_spans` | `dict[str, SpanSpec] \| None` | TextSpans resolved to token indices |
+| `span_hidden_states_mean` | `dict[str, ndarray] \| None` | Per-span mean hidden state `(num_layers, hidden)` |
+| `thinking_hidden_state` | `ndarray \| None` | Hidden state at the last thinking token `(num_layers, hidden)` |
+| `thinking_end_token_pos` | `int \| None` | Position of the thinking-end token in the output sequence |
 
 ---
 
