@@ -41,8 +41,16 @@ if TYPE_CHECKING:
 
 
 def _to_numpy(tensor) -> np.ndarray:
-    """Detach, move to CPU, convert to NumPy — safe on any device."""
-    return tensor.detach().cpu().numpy()
+    """Detach, move to CPU, convert to NumPy — safe on any device/dtype.
+
+    NumPy has no bfloat16 type, so bfloat16 tensors are cast to float32
+    before conversion.  All other dtypes are passed through unchanged.
+    """
+    import torch
+    t = tensor.detach().cpu()
+    if t.dtype == torch.bfloat16:
+        t = t.float()
+    return t.numpy()
 
 
 def _process_step(item: dict, store: "InternalsStore") -> None:
