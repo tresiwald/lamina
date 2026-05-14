@@ -60,6 +60,15 @@ class InternalsConfig:
     extract_logits: bool = True
     extract_logit_lens: bool = False   # off by default — needs register_model()
 
+    # When True (default) output_hidden_states stores every generated token's
+    # hidden state — (num_layers, batch, num_output_tokens, hidden_dim).
+    # Set to False to skip the big array and only compute:
+    #   • output_hidden_states_mean  (always)
+    #   • InternalsRun.last_output_hidden_state  (num_layers, hidden_dim)
+    #   • InternalsRun.thinking_end_hidden_state (num_layers, hidden_dim)
+    # This reduces peak memory by ~(num_output_tokens − 2) × per-token cost.
+    extract_output_hidden_states: bool = True
+
     # ── aggregation ──────────────────────────────────────────────────────────
     aggregate_attention_heads: bool = True
 

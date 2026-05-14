@@ -20,8 +20,19 @@ class InternalsStore:
         self._runs: deque = deque(maxlen=maxlen)
         self._active: Dict[str, InternalsRun] = {}
 
-    def start_run(self, run_id: str, input_len: int) -> InternalsRun:
-        run = InternalsRun(run_id, input_len)
+    def start_run(
+        self,
+        run_id: str,
+        input_len: int,
+        config=None,
+        thinking_end_token_id: Optional[int] = None,
+    ) -> InternalsRun:
+        run = InternalsRun(
+            run_id,
+            input_len,
+            config=config,
+            thinking_end_token_id=thinking_end_token_id,
+        )
         with self._lock:
             self._active[run_id] = run
         return run

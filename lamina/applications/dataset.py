@@ -591,17 +591,36 @@ class InternalsDataset:
                     )
                 resolved_spans = instance.spans  # type: ignore[assignment]
 
+            # ── Resolve thinking end token ID ────────────────────────────────
+            tt_id: Optional[int] = None
+            if effective_tt is not None and use_generate:
+                tt_ids = tokenizer.encode(effective_tt, add_special_tokens=False)
+                if not tt_ids:
+                    warnings.warn(
+                        f"[lamina] thinking_end_token {effective_tt!r} encodes "
+                        "to an empty sequence — skipping thinking extraction.",
+                        stacklevel=2,
+                    )
+                    effective_tt = None  # disable for this instance
+                else:
+                    tt_id = tt_ids[-1]  # anchor on the last sub-token
+
             # ── Inference ─────────────────────────────────────────────────────
+            # Pass thinking token ID to the extractor so the in-worker detector
+            # can capture the hidden state without storing all output hs.
             gen_output = None
             if use_generate:
+                if tt_id is not None:
+                    _ext._next_thinking_end_token_id = tt_id
                 kwargs = dict(gkw)
                 if "attention_mask" in enc:
                     kwargs.setdefault("attention_mask", enc["attention_mask"])
-                # Always request return_dict_in_generate so we can read
-                # .sequences for thinking-token detection.
                 if effective_tt is not None:
                     kwargs.setdefault("return_dict_in_generate", True)
-                gen_output = model.generate(input_ids, **kwargs)
+                try:
+                    gen_output = model.generate(input_ids, **kwargs)
+                finally:
+                    _ext._next_thinking_end_token_id = None  # always reset
             else:
                 run_forward(model, **enc)
 
@@ -623,40 +642,20 @@ class InternalsDataset:
             thinking_hs:  Optional[np.ndarray] = None
             thinking_pos: Optional[int]        = None
 
-            if effective_tt is not None and use_generate and gen_output is not None:
-                # Resolve the thinking end token to a single token ID.
-                tt_ids = tokenizer.encode(
-                    effective_tt, add_special_tokens=False
-                )
-                if not tt_ids:
-                    warnings.warn(
-                        f"[lamina] thinking_end_token {effective_tt!r} encodes "
-                        "to an empty sequence — skipping thinking extraction.",
-                        stacklevel=2,
-                    )
-                elif run.output_hidden_states is None:
-                    warnings.warn(
-                        "[lamina] thinking_end_token set but output_hidden_states "
-                        "are unavailable (encoder-only model?) — skipping.",
-                        stacklevel=2,
-                    )
-                else:
-                    # Extract the generated token IDs (prompt stripped).
+            if effective_tt is not None and tt_id is not None and use_generate:
+                # Fast path: in-worker detection stored result on the run
+                if run.thinking_end_hidden_state is not None:
+                    thinking_hs  = run.thinking_end_hidden_state
+                    thinking_pos = run.thinking_end_token_pos
+
+                # Fallback: scan output_hidden_states (when available)
+                elif run.output_hidden_states is not None and gen_output is not None:
                     if hasattr(gen_output, "sequences"):
                         full_ids = gen_output.sequences[0].cpu().numpy()
                     else:
-                        # Plain tensor returned (return_dict_in_generate=False)
                         full_ids = gen_output[0].cpu().numpy()
-                    prompt_len = int(input_ids.shape[-1])
+                    prompt_len   = int(input_ids.shape[-1])
                     generated_ids = full_ids[prompt_len:]
-
-                    # Use only the first sub-token if thinking token is multi-token
-                    tt_id = tt_ids[-1]  # last token is the closing ">" char
-                    if len(tt_ids) > 1:
-                        # Search for the full sequence; use position of last token
-                        # (most robust single-token anchor for the closing tag)
-                        tt_id = tt_ids[-1]
-
                     thinking_hs, thinking_pos = _extract_thinking_hidden_state(
                         run, generated_ids, tt_id
                     )
@@ -667,6 +666,15 @@ class InternalsDataset:
                             "output — thinking_hidden_state will be None.",
                             stacklevel=2,
                         )
+
+                else:
+                    warnings.warn(
+                        "[lamina] thinking_end_token set but neither in-worker "
+                        "detection succeeded nor output_hidden_states are available."
+                        " Set extract_logits=True (needed for in-worker detection)"
+                        " or extract_output_hidden_states=True (post-hoc fallback).",
+                        stacklevel=2,
+                    )
 
             # ── Span averages ─────────────────────────────────────────────────
             span_means = _compute_span_means(run, resolved_spans)

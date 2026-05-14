@@ -46,6 +46,11 @@ _final_norm_fn:  Optional[Callable]   = None
 # Last run started — lets callers retrieve the run after generate() returns
 _last_started_run_id: Optional[str] = None
 
+# Per-run thinking-end token ID set by dataset.py before each generate() call.
+# Reset to None immediately after the run starts so it doesn't bleed into
+# the next run.
+_next_thinking_end_token_id: Optional[int] = None
+
 
 def _initialise(
     config: InternalsConfig,
@@ -152,10 +157,17 @@ def _patched_generate(self, input_ids, **kwargs):
         kwargs.setdefault("output_attentions", True)
     kwargs.setdefault("return_dict_in_generate", True)
 
-    global _last_started_run_id
+    global _last_started_run_id, _next_thinking_end_token_id
     run_id    = str(uuid.uuid4())
     input_len = input_ids.shape[-1]
-    _store.start_run(run_id, input_len)
+    thinking_token_id = _next_thinking_end_token_id
+    _next_thinking_end_token_id = None   # consume — don't bleed into next run
+    _store.start_run(
+        run_id,
+        input_len,
+        config=config,
+        thinking_end_token_id=thinking_token_id,
+    )
     _last_started_run_id = run_id
 
     step_counter = [0]
@@ -283,8 +295,16 @@ def run_forward(model: Any, *args: Any, **kwargs: Any) -> Any:
     input_ids = args[0] if args else kwargs.get("input_ids")
     input_len = input_ids.shape[-1] if input_ids is not None else 0
 
+    global _next_thinking_end_token_id
     run_id = str(uuid.uuid4())
-    _store.start_run(run_id, input_len)
+    thinking_token_id = _next_thinking_end_token_id
+    _next_thinking_end_token_id = None
+    _store.start_run(
+        run_id,
+        input_len,
+        config=config,
+        thinking_end_token_id=thinking_token_id,
+    )
     _last_started_run_id = run_id
 
     step_counter = [0]
