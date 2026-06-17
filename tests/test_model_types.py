@@ -1456,42 +1456,51 @@ class TestSSMModelTypeDetection:
 
 
 # ---------------------------------------------------------------------------
-# 16. TestStreamingModeSSM — streaming output hs with SSM model
+# 16. TestSSMMultiToken — SSM with several generated tokens
 # ---------------------------------------------------------------------------
 
-class TestStreamingModeSSM:
+class TestSSMMultiToken:
     """
-    When extract_output_hidden_states=False, streaming accumulation should
-    work correctly for SSM models (same code path as decoder-only).
+    Verify that SSM models produce correctly shaped hidden states and logits
+    when multiple tokens are generated (i.e. the recurrent/single-token
+    forward path at steps 1+ is exercised).
     """
 
-    def _run(self, fresh_plugin, max_new_tokens=3):
-        cfg, _, _ = fresh_plugin
-        cfg.extract_output_hidden_states = False
+    @pytest.mark.parametrize("ModelCls,n_tokens", [
+        (FakeMambaModel, 1),
+        (FakeMambaModel, 5),
+        (FakeRWKVModel,  3),
+    ])
+    def test_output_hs_accumulates_per_token(self, ModelCls, n_tokens, fresh_plugin):
+        model  = ModelCls()
+        inputs = _fake_inputs()
+        run, _ = _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
+                               max_new_tokens=n_tokens)
+        assert run.output_hidden_states is not None
+        assert run.output_hidden_states[0].shape[1] == n_tokens
 
+    def test_num_layers_correct(self, fresh_plugin):
         model  = FakeMambaModel()
         inputs = _fake_inputs()
-        return _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
-                             max_new_tokens=max_new_tokens)
+        run, _ = _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
+                               max_new_tokens=2)
+        # embedding + NUM_LAYERS transformer blocks
+        assert run.num_layers == NUM_LAYERS + 1
 
-    def test_output_hs_not_stored(self, fresh_plugin):
-        run, _ = self._run(fresh_plugin)
-        assert run.output_hidden_states is None
-
-    def test_output_mean_computed(self, fresh_plugin):
-        run, _ = self._run(fresh_plugin)
-        assert run.output_hidden_states_mean is not None
+    def test_output_hs_mean_shape(self, fresh_plugin):
+        model  = FakeMambaModel()
+        inputs = _fake_inputs()
+        run, _ = _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
+                               max_new_tokens=4)
         assert run.output_hidden_states_mean.shape == (NUM_LAYERS + 1, BATCH, HIDDEN)
 
-    def test_last_output_hidden_state(self, fresh_plugin):
-        run, _ = self._run(fresh_plugin)
-        assert run.last_output_hidden_state is not None
-        assert run.last_output_hidden_state.shape == (NUM_LAYERS + 1, HIDDEN)
-
-    def test_input_hs_still_captured(self, fresh_plugin):
-        run, _ = self._run(fresh_plugin)
-        assert run.input_hidden_states is not None
-        assert run.input_hidden_states[0].shape == (BATCH, INPUT_LEN, HIDDEN)
+    def test_logits_step_count(self, fresh_plugin):
+        """One logits entry per forward call (1 prompt + N generated)."""
+        model  = FakeMambaModel()
+        inputs = _fake_inputs()
+        run, _ = _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
+                               max_new_tokens=3)
+        assert run.logits.shape[0] == 4  # step 0 + 3 generated
 
 
 # ---------------------------------------------------------------------------
