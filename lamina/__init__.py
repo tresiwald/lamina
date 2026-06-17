@@ -126,6 +126,7 @@ from .extractors.hf.extractor   import (
     install_patches,
     uninstall_patches,
     run_forward,
+    run_diffusion,
 )
 from .extractors.hf.lm_head     import register_model
 from .extractors.hf.model_detect import _model_can_generate
@@ -153,6 +154,7 @@ __all__ = [
     "wait_for_run",
     "set_config",
     "run_forward",
+    "run_diffusion",
     "register_model",
     # Interventions
     "Intervention",

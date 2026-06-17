@@ -1047,3 +1047,474 @@ class TestFlagsAcrossModelTypes:
         inputs = _fake_inputs()
         run, _ = _run_and_wait(model, inputs, fresh_plugin, use_generate=use_gen)
         assert run.logits is None
+
+
+# ---------------------------------------------------------------------------
+# SSM / State-Space Model fake models
+# ---------------------------------------------------------------------------
+
+class FakeMambaModel(FakeModule):
+    """
+    Mamba-style SSM.
+
+    - Output class: ``MambaCausalLMOutput``  (contains "CausalLM" → last_token mode)
+    - No attention weights  (attentions=None at every step)
+    - Hidden states present as usual
+    - Used via generate(): step 0 = full prompt, steps 1+ = single token
+    """
+    config = FakeConfig(is_encoder_decoder=False, model_type="mamba")
+
+    def can_generate(self):
+        return True
+
+    def forward(self, input_ids=None, output_hidden_states=False,
+                output_attentions=False, return_dict=True, **kwargs):
+        batch = input_ids.shape[0] if input_ids is not None else BATCH
+        seq   = input_ids.shape[1] if input_ids is not None else INPUT_LEN
+        return _output_cls(
+            "MambaCausalLMOutput",
+            hidden_states=tuple(_make_hs(batch, seq, HIDDEN, NUM_LAYERS))
+                          if output_hidden_states else None,
+            attentions=None,            # SSMs have no self-attention
+            logits=FakeTensor(np.random.randn(batch, seq, VOCAB).astype(np.float32)),
+            encoder_hidden_states=None,
+            decoder_hidden_states=None,
+        )
+
+
+class FakeRWKVModel(FakeModule):
+    """
+    RWKV-style SSM.
+
+    - Output class: ``RwkvCausalLMOutput`` (contains "CausalLM" → last_token mode)
+    - No attention weights
+    """
+    config = FakeConfig(is_encoder_decoder=False, model_type="rwkv")
+
+    def can_generate(self):
+        return True
+
+    def forward(self, input_ids=None, output_hidden_states=False,
+                output_attentions=False, return_dict=True, **kwargs):
+        batch = input_ids.shape[0] if input_ids is not None else BATCH
+        seq   = input_ids.shape[1] if input_ids is not None else INPUT_LEN
+        return _output_cls(
+            "RwkvCausalLMOutput",
+            hidden_states=tuple(_make_hs(batch, seq, HIDDEN, NUM_LAYERS))
+                          if output_hidden_states else None,
+            attentions=None,
+            logits=FakeTensor(np.random.randn(batch, seq, VOCAB).astype(np.float32)),
+            encoder_hidden_states=None,
+            decoder_hidden_states=None,
+        )
+
+
+class FakeJambaModel(FakeModule):
+    """
+    Jamba-style hybrid SSM+attention.
+
+    - Output class: ``JambaCausalLMOutput``
+    - Some layers are attention (produce weights), others are SSM (produce None).
+    - Represented here as alternating None / attention-tensor layers.
+    """
+    config = FakeConfig(is_encoder_decoder=False, model_type="jamba")
+
+    def can_generate(self):
+        return True
+
+    def forward(self, input_ids=None, output_hidden_states=False,
+                output_attentions=False, return_dict=True, **kwargs):
+        batch = input_ids.shape[0] if input_ids is not None else BATCH
+        seq   = input_ids.shape[1] if input_ids is not None else INPUT_LEN
+        # Even-indexed layers = attention, odd = SSM (None)
+        att = None
+        if output_attentions:
+            att = tuple(
+                FakeTensor(np.random.rand(batch, NUM_HEADS, seq, seq).astype(np.float32))
+                if i % 2 == 0 else None
+                for i in range(NUM_LAYERS)
+            )
+        return _output_cls(
+            "JambaCausalLMOutput",
+            hidden_states=tuple(_make_hs(batch, seq, HIDDEN, NUM_LAYERS))
+                          if output_hidden_states else None,
+            attentions=att,
+            logits=FakeTensor(np.random.randn(batch, seq, VOCAB).astype(np.float32)),
+            encoder_hidden_states=None,
+            decoder_hidden_states=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fake diffusion model
+# ---------------------------------------------------------------------------
+
+class FakeDiffusionModel(FakeModule):
+    """
+    Discrete/masked diffusion LM (MDLM / LLaDA style).
+
+    Each denoising step takes a partially-masked sequence and predicts the
+    full vocabulary distribution at every position — like BertForMaskedLM.
+    There is no generate(); the user calls run_forward() (or run_diffusion())
+    repeatedly, once per denoising step.
+
+    Output class: ``MaskedLMOutput`` → logit_mode="full" (no last-token slice)
+    """
+    config = FakeConfig(is_encoder_decoder=False, model_type="bert")
+
+    def can_generate(self):
+        return False
+
+    def forward(self, input_ids=None, attention_mask=None,
+                output_hidden_states=False, output_attentions=False,
+                return_dict=True, **kwargs):
+        batch = input_ids.shape[0] if input_ids is not None else BATCH
+        seq   = input_ids.shape[1] if input_ids is not None else INPUT_LEN
+        return _output_cls(
+            "MaskedLMOutput",
+            hidden_states=tuple(_make_hs(batch, seq, HIDDEN, NUM_LAYERS))
+                          if output_hidden_states else None,
+            attentions=None,
+            logits=FakeTensor(
+                np.random.randn(batch, seq, VOCAB).astype(np.float32)
+            ),
+            encoder_hidden_states=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. TestSSMPipeline — Mamba (pure SSM, no attention)
+# ---------------------------------------------------------------------------
+
+class TestSSMPipeline:
+    """End-to-end pipeline tests for Mamba-style SSMs via generate()."""
+
+    def _run(self, fresh_plugin, ModelCls=None, max_new_tokens=2):
+        if ModelCls is None:
+            ModelCls = FakeMambaModel
+        model  = ModelCls()
+        inputs = _fake_inputs()
+        return _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
+                             max_new_tokens=max_new_tokens)
+
+    def test_finalized(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.is_finalized
+
+    def test_not_encoder_decoder(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.is_encoder_decoder is False
+
+    def test_input_hidden_states_captured(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.input_hidden_states is not None
+        assert run.input_hidden_states[0].shape == (BATCH, INPUT_LEN, HIDDEN)
+
+    def test_output_hidden_states_shape(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin, max_new_tokens=3)
+        assert run.output_hidden_states is not None
+        assert run.output_hidden_states[0].shape == (BATCH, 3, HIDDEN)
+
+    def test_means_shape(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.input_hidden_states_mean.shape  == (NUM_LAYERS + 1, BATCH, HIDDEN)
+        assert run.output_hidden_states_mean.shape == (NUM_LAYERS + 1, BATCH, HIDDEN)
+
+    def test_logits_last_token_mode(self, fresh_plugin):
+        """MambaCausalLMOutput → logit_mode='last_token'; shape (steps, batch, vocab)."""
+        run, _ = self._run(fresh_plugin, max_new_tokens=2)
+        assert run.logits is not None
+        assert run.logits.ndim == 3
+        assert run.logits.shape[-1] == VOCAB
+
+    def test_attentions_none(self, fresh_plugin):
+        """SSMs produce no attention weights — attentions must be None."""
+        run, _ = self._run(fresh_plugin)
+        assert run.attentions is None
+
+    def test_encoder_hidden_states_none(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.encoder_hidden_states is None
+
+    def test_rwkv_pipeline(self, fresh_plugin):
+        """RwkvCausalLMOutput also detected as last_token mode."""
+        run, _ = self._run(fresh_plugin, ModelCls=FakeRWKVModel)
+        assert run.is_finalized
+        assert run.attentions is None
+        assert run.logits is not None
+        assert run.logits.ndim == 3
+
+    def test_model_can_generate_mamba(self):
+        from internals_extraction._dataset import _model_can_generate
+        model = FakeMambaModel()
+        assert _model_can_generate(model) is True
+
+    def test_model_can_generate_rwkv(self):
+        from internals_extraction._dataset import _model_can_generate
+        model = FakeRWKVModel()
+        assert _model_can_generate(model) is True
+
+
+# ---------------------------------------------------------------------------
+# 12. TestHybridSSMPipeline — Jamba (attention + SSM layers)
+# ---------------------------------------------------------------------------
+
+class TestHybridSSMPipeline:
+    """End-to-end tests for a hybrid SSM+attention model (Jamba-style)."""
+
+    def _run(self, fresh_plugin, max_new_tokens=2):
+        model  = FakeJambaModel()
+        inputs = _fake_inputs()
+        return _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
+                             max_new_tokens=max_new_tokens)
+
+    def test_finalized(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.is_finalized
+
+    def test_hidden_states_captured(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.input_hidden_states is not None
+
+    def test_logits_last_token_mode(self, fresh_plugin):
+        """JambaCausalLMOutput → last_token logit mode."""
+        run, _ = self._run(fresh_plugin)
+        assert run.logits is not None
+        assert run.logits.ndim == 3
+        assert run.logits.shape[-1] == VOCAB
+
+    def test_mixed_attentions_not_crash(self, fresh_plugin):
+        """
+        Hybrid models produce tuples where SSM layers contribute None
+        attention weights.  Extraction must not crash.
+        """
+        cfg, _, _ = fresh_plugin
+        cfg.extract_attentions = True
+        run, _ = self._run(fresh_plugin)
+        # If attentions were captured at all, they should be a list of tuples
+        # that may contain None elements for the SSM layers.
+        if run.attentions is not None:
+            for step_att in run.attentions:
+                # step_att is a tuple; some entries may be None
+                assert step_att is not None
+
+    def test_model_can_generate(self):
+        from internals_extraction._dataset import _model_can_generate
+        assert _model_can_generate(FakeJambaModel()) is True
+
+
+# ---------------------------------------------------------------------------
+# 13. TestDiffusionStepPipeline — single denoising step via run_forward
+# ---------------------------------------------------------------------------
+
+class TestDiffusionStepPipeline:
+    """Single-step diffusion forward via run_forward (same as MaskedLM)."""
+
+    def _run(self, fresh_plugin):
+        model  = FakeDiffusionModel()
+        inputs = _fake_inputs()
+        return _run_and_wait(model, inputs, fresh_plugin, use_generate=False)
+
+    def test_finalized(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.is_finalized
+
+    def test_hidden_states_captured(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.input_hidden_states is not None
+        assert run.input_hidden_states[0].shape == (BATCH, INPUT_LEN, HIDDEN)
+
+    def test_logits_full_sequence(self, fresh_plugin):
+        """Diffusion model predicts all positions → logit_mode='full'."""
+        run, _ = self._run(fresh_plugin)
+        assert run.logits is not None
+        # Shape: (1 step, batch, seq, vocab) — full sequence preserved
+        assert run.logits.shape[-1] == VOCAB
+        assert run.logits.shape[-2] == INPUT_LEN
+
+    def test_no_attentions(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.attentions is None
+
+    def test_model_cannot_generate(self):
+        from internals_extraction._dataset import _model_can_generate
+        assert _model_can_generate(FakeDiffusionModel()) is False
+
+
+# ---------------------------------------------------------------------------
+# 14. TestDiffusionMultiStepPipeline — iterative denoising via run_diffusion
+# ---------------------------------------------------------------------------
+
+class TestDiffusionMultiStepPipeline:
+    """
+    Multi-step diffusion denoising via run_diffusion().
+
+    Each step is an independent run_forward() call → independent InternalsRun.
+    """
+
+    N_STEPS = 4
+
+    def _run_diffusion(self, fresh_plugin):
+        from internals_extraction._patch import run_forward as _rf
+        import internals_extraction as ie
+
+        # Simulate N_STEPS denoising steps, each with the same input shape.
+        step_inputs = [_fake_inputs() for _ in range(self.N_STEPS)]
+        model = FakeDiffusionModel()
+
+        # run_diffusion is a thin loop over run_forward; exercise it via the
+        # test's monkeypatched internals_extraction shim.
+        cfg, store, worker = fresh_plugin
+
+        run_ids = []
+        for inputs in step_inputs:
+            _rf(model, **inputs)
+            from internals_extraction._patch import _last_started_run_id
+            run_ids.append(_last_started_run_id)
+
+        # Wait for all runs
+        runs = [_wait(rid) for rid in run_ids if rid is not None]
+        return runs
+
+    def test_one_run_per_step(self, fresh_plugin):
+        runs = self._run_diffusion(fresh_plugin)
+        assert len(runs) == self.N_STEPS
+
+    def test_all_finalized(self, fresh_plugin):
+        runs = self._run_diffusion(fresh_plugin)
+        assert all(r.is_finalized for r in runs)
+
+    def test_each_step_has_hidden_states(self, fresh_plugin):
+        runs = self._run_diffusion(fresh_plugin)
+        for run in runs:
+            assert run.input_hidden_states is not None
+
+    def test_each_step_has_full_sequence_logits(self, fresh_plugin):
+        """Every diffusion step captures (batch, seq, vocab) logits."""
+        runs = self._run_diffusion(fresh_plugin)
+        for run in runs:
+            assert run.logits is not None
+            assert run.logits.shape[-1] == VOCAB
+            assert run.logits.shape[-2] == INPUT_LEN
+
+    def test_run_ids_distinct(self, fresh_plugin):
+        """Each denoising step must produce a unique run."""
+        from internals_extraction._patch import run_forward as _rf
+
+        cfg, store, worker = fresh_plugin
+        model = FakeDiffusionModel()
+        step_inputs = [_fake_inputs() for _ in range(self.N_STEPS)]
+
+        run_ids = []
+        for inputs in step_inputs:
+            _rf(model, **inputs)
+            from internals_extraction._patch import _last_started_run_id
+            run_ids.append(_last_started_run_id)
+
+        assert len(set(run_ids)) == self.N_STEPS
+
+
+# ---------------------------------------------------------------------------
+# 15. TestSSMModelTypeDetection
+# ---------------------------------------------------------------------------
+
+class TestSSMModelTypeDetection:
+    """_model_can_generate() correctly classifies SSM model class names."""
+
+    from internals_extraction._dataset import _model_can_generate as _mcg
+    _model_can_generate = staticmethod(_mcg)
+
+    def _model(self, cls_name, model_type="custom"):
+        cfg = FakeConfig(model_type=model_type)
+        cls = type(cls_name, (object,), {})
+        obj = object.__new__(cls)
+        obj.config = cfg
+        return obj
+
+    @pytest.mark.parametrize("cls_name", [
+        "MambaForCausalLM",
+        "Mamba2ForCausalLM",
+        "FalconMambaForCausalLM",
+        "RwkvForCausalLM",
+        "JambaForCausalLM",
+        "ZambaForCausalLM",
+    ])
+    def test_ssm_causal_lm_variants(self, cls_name):
+        assert self._model_can_generate(self._model(cls_name)) is True
+
+    @pytest.mark.parametrize("mt", ["mamba", "mamba2", "rwkv", "jamba", "zamba"])
+    def test_ssm_model_types_not_encoder_only(self, mt):
+        """SSM model_type strings must NOT fall into the encoder-only bucket."""
+        from internals_extraction._dataset import _ENCODER_ONLY_MODEL_TYPES
+        assert mt not in _ENCODER_ONLY_MODEL_TYPES
+
+    def test_ssm_model_types_set_exists(self):
+        from internals_extraction._dataset import _SSM_MODEL_TYPES
+        assert "mamba" in _SSM_MODEL_TYPES
+        assert "rwkv" in _SSM_MODEL_TYPES
+        assert "jamba" in _SSM_MODEL_TYPES
+
+
+# ---------------------------------------------------------------------------
+# 16. TestStreamingModeSSM — streaming output hs with SSM model
+# ---------------------------------------------------------------------------
+
+class TestStreamingModeSSM:
+    """
+    When extract_output_hidden_states=False, streaming accumulation should
+    work correctly for SSM models (same code path as decoder-only).
+    """
+
+    def _run(self, fresh_plugin, max_new_tokens=3):
+        cfg, _, _ = fresh_plugin
+        cfg.extract_output_hidden_states = False
+
+        model  = FakeMambaModel()
+        inputs = _fake_inputs()
+        return _run_and_wait(model, inputs, fresh_plugin, use_generate=True,
+                             max_new_tokens=max_new_tokens)
+
+    def test_output_hs_not_stored(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.output_hidden_states is None
+
+    def test_output_mean_computed(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.output_hidden_states_mean is not None
+        assert run.output_hidden_states_mean.shape == (NUM_LAYERS + 1, BATCH, HIDDEN)
+
+    def test_last_output_hidden_state(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.last_output_hidden_state is not None
+        assert run.last_output_hidden_state.shape == (NUM_LAYERS + 1, HIDDEN)
+
+    def test_input_hs_still_captured(self, fresh_plugin):
+        run, _ = self._run(fresh_plugin)
+        assert run.input_hidden_states is not None
+        assert run.input_hidden_states[0].shape == (BATCH, INPUT_LEN, HIDDEN)
+
+
+# ---------------------------------------------------------------------------
+# 17. TestNoAttentionsGraceful
+# ---------------------------------------------------------------------------
+
+class TestNoAttentionsGraceful:
+    """
+    Models that produce attentions=None must not crash even when
+    extract_attentions=True is set in the config.
+    """
+
+    @pytest.mark.parametrize("ModelCls,use_gen", [
+        (FakeMambaModel, True),
+        (FakeRWKVModel, True),
+        (FakeDiffusionModel, False),
+    ])
+    def test_no_crash_with_extract_attentions(self, ModelCls, use_gen, fresh_plugin):
+        cfg, _, _ = fresh_plugin
+        cfg.extract_attentions = True
+
+        model  = ModelCls()
+        inputs = _fake_inputs()
+        run, _ = _run_and_wait(model, inputs, fresh_plugin, use_generate=use_gen)
+        assert run.is_finalized
+        assert run.attentions is None

@@ -59,6 +59,15 @@ _ENCODER_ONLY_MODEL_TYPES: frozenset = frozenset({
     "visual_bert", "clip_text_model",
 })
 
+# State-space model (SSM) model_type strings — all generative, no attention.
+# Listed here for documentation; they already match _GENERATIVE_SUFFIXES via
+# "ForCausalLM" in their class names.
+_SSM_MODEL_TYPES: frozenset = frozenset({
+    "mamba", "mamba2", "falcon_mamba",  # Mamba family
+    "rwkv", "rwkv4", "rwkv5", "rwkv6",  # RWKV family
+    "jamba", "zamba",                    # Hybrid SSM+attention
+})
+
 
 def _model_can_generate(model) -> bool:
     """

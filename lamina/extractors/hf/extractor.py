@@ -260,6 +260,49 @@ def _patched_forward(self, *args, **kwargs):
 # run_forward — hook-based capture for a single forward pass
 # ---------------------------------------------------------------------------
 
+def run_diffusion(
+    model: Any,
+    steps: List[Dict[str, Any]],
+) -> List[Optional[str]]:
+    """
+    Capture internals from a **diffusion model's iterative denoising loop**.
+
+    Calls :func:`run_forward` once per denoising step and returns the
+    corresponding run-ids in order.  Each step produces an independent
+    :class:`~lamina.core.run.InternalsRun` in the store.
+
+    Parameters
+    ----------
+    model : any object with ``register_forward_hook`` and ``__call__``
+    steps : list[dict]
+        One ``kwargs`` dict per denoising step; forwarded verbatim to
+        ``run_forward(model, **step_kwargs)``.
+
+    Returns
+    -------
+    list[str | None]
+        One run-id per step (``None`` if the extractor is not initialised).
+
+    Example
+    -------
+    ::
+
+        # Build the partially-masked inputs for each diffusion step
+        step_inputs = [
+            {"input_ids": masked_ids_t}
+            for masked_ids_t in diffusion_schedule(input_ids, n_steps=10)
+        ]
+        run_ids = lamina.run_diffusion(model, step_inputs)
+        # Wait for finalization, then inspect each step:
+        runs = [lamina.get_run(rid) for rid in run_ids]
+    """
+    run_ids: List[Optional[str]] = []
+    for step_kwargs in steps:
+        run_forward(model, **step_kwargs)
+        run_ids.append(_last_started_run_id)
+    return run_ids
+
+
 def run_forward(model: Any, *args: Any, **kwargs: Any) -> Any:
     """
     Capture internals from a **single forward pass** using
