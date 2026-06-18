@@ -193,6 +193,17 @@ class InternalsRecord:
         Zero-based index into the *output* token sequence where the last
         thinking token was found.  ``None`` when ``thinking_hidden_state``
         is ``None``.
+    generated_ids : np.ndarray | None
+        1-D integer array of **output** token IDs (prompt tokens excluded).
+        Populated for generative models only; ``None`` for encoder-only /
+        classifier / forward-only models.
+    generated_text : str | None
+        The decoded output text (``tokenizer.decode(generated_ids,
+        skip_special_tokens=True)``).  ``None`` when ``generated_ids`` is
+        ``None``.  Useful for running an NLP pipeline (e.g. spaCy) over
+        the model's output and then aligning word-level labels back to
+        token positions via
+        :func:`lamina.applications.alignment.align_word_labels`.
     """
     instance: InternalsInstance
     run: Any                   # InternalsRun (avoid circular import)
@@ -200,6 +211,8 @@ class InternalsRecord:
     span_hidden_states_mean: Optional[Dict[str, np.ndarray]] = None
     thinking_hidden_state: Optional[np.ndarray] = None
     thinking_end_token_pos: Optional[int] = None
+    generated_ids: Optional[np.ndarray] = None
+    generated_text: Optional[str] = None
 
     @property
     def properties(self) -> Dict[str, Any]:
@@ -676,6 +689,24 @@ class InternalsDataset:
                         stacklevel=2,
                     )
 
+            # ── Generated token IDs and decoded text ──────────────────────────
+            rec_generated_ids: Optional[np.ndarray] = None
+            rec_generated_text: Optional[str]        = None
+
+            if use_generate and gen_output is not None:
+                try:
+                    if hasattr(gen_output, "sequences"):
+                        full_ids_arr = gen_output.sequences[0].cpu().numpy()
+                    else:
+                        full_ids_arr = gen_output[0].cpu().numpy()
+                    prompt_len_for_ids = int(input_ids.shape[-1])
+                    rec_generated_ids  = full_ids_arr[prompt_len_for_ids:]
+                    rec_generated_text = tokenizer.decode(
+                        rec_generated_ids, skip_special_tokens=True
+                    )
+                except Exception:
+                    pass  # non-standard generate output — silently skip
+
             # ── Span averages ─────────────────────────────────────────────────
             span_means = _compute_span_means(run, resolved_spans)
             records.append(InternalsRecord(
@@ -685,6 +716,8 @@ class InternalsDataset:
                 span_hidden_states_mean=span_means,
                 thinking_hidden_state=thinking_hs,
                 thinking_end_token_pos=thinking_pos,
+                generated_ids=rec_generated_ids,
+                generated_text=rec_generated_text,
             ))
 
         if verbose:

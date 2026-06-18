@@ -139,8 +139,17 @@ from .backends.filesystem  import dump, load
 from .backends.hf_dataset  import to_hf_dataset
 
 # ── Applications ──────────────────────────────────────────────────────────────
-from .applications.spans   import SpanSpec, TextSpan, SpanResolutionError
-from .applications.dataset import InternalsInstance, InternalsRecord, InternalsDataset
+from .applications.spans     import SpanSpec, TextSpan, SpanResolutionError
+from .applications.dataset   import InternalsInstance, InternalsRecord, InternalsDataset
+from .applications.alignment import (
+    word_ids,
+    word_to_token_spans,
+    align_word_labels,
+)
+from .applications.probing   import LinearProbe, ProbeResult, normalized_depth
+
+# ── Diffusion extractor stub ──────────────────────────────────────────────────
+from .extractors.diffusion.extractor import DiffusionExtractor
 
 __all__ = [
     # Core types
@@ -165,6 +174,16 @@ __all__ = [
     "InternalsInstance",
     "InternalsRecord",
     "InternalsDataset",
+    # Alignment utilities
+    "word_ids",
+    "word_to_token_spans",
+    "align_word_labels",
+    # Probing
+    "LinearProbe",
+    "ProbeResult",
+    "normalized_depth",
+    # Extractors
+    "DiffusionExtractor",
     # Serialisation
     "dump",
     "load",

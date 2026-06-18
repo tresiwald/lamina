@@ -449,7 +449,34 @@ class InternalsRun:
     def num_layers(self) -> Optional[int]:
         if self.input_hidden_states is not None:
             return len(self.input_hidden_states)
+        if self.output_hidden_states is not None:
+            return len(self.output_hidden_states)
+        if self.last_output_hidden_state is not None:
+            return self.last_output_hidden_state.shape[0]
         return None
+
+    @property
+    def normalized_depths(self) -> Optional[np.ndarray]:
+        """
+        Normalized layer depth array of shape ``(num_layers,)``, values in
+        ``[0.0, 1.0]``.
+
+        ``depths[0] = 0.0`` (embedding layer) and
+        ``depths[-1] = 1.0`` (final transformer block).
+
+        Use this to compare representations across architectures with
+        different numbers of layers (e.g. GPT-2 vs Llama-3 vs Mamba)
+        by indexing at the same *relative* depth rather than the same
+        absolute layer index.
+
+        Returns ``None`` when ``num_layers`` is not yet known.
+        """
+        n = self.num_layers
+        if n is None:
+            return None
+        if n == 1:
+            return np.array([0.0], dtype=np.float32)
+        return np.linspace(0.0, 1.0, n, dtype=np.float32)
 
     @property
     def num_output_tokens(self) -> Optional[int]:
